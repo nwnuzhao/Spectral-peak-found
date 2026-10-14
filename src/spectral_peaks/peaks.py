@@ -787,6 +787,7 @@ def detect_peaks(
     cwt_min_length: int | None = None,
     max_peaks: int | None = None,
     area_span: float = 3.0,
+    max_width: float | None = None,
     fit_model: str | None = None,
     fit_kwargs: dict | None = None,
 ) -> PeakResult:
@@ -826,6 +827,11 @@ def detect_peaks(
     area_span
         Width of the integration window used for ``Peak.area``, in units of the
         measured peak width (``3.0`` means ``+-1.5`` FWHM).
+    max_width
+        Reject peaks wider than this many samples.  Handy for discarding the
+        broad residual structures that an imperfect baseline correction can
+        leave behind (they are low but wide, so a prominence threshold alone may
+        not remove them).
     fit_model
         When given (``"gaussian"``, ``"lorentzian"``, ``"pseudo_voigt"`` or
         ``"voigt"``) every peak is refined by a local least-squares fit, whose
@@ -882,6 +888,13 @@ def detect_peaks(
         scale = float(estimate_noise(processed, method="mad"))
         if scale > 0.0:
             prominence = 5.0 * scale
+
+    if max_width is not None:
+        if width is not None:
+            raise ValueError("pass either width or max_width, not both")
+        # width is expressed in samples here, so the filter is applied on the
+        # measured sample widths (see the width= argument of find_peaks)
+        width = (None, float(max_width))
 
     common = dict(
         height=height,

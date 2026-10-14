@@ -74,16 +74,25 @@ def pseudo_voigt(
 def _voigt_profile(offsets: np.ndarray, sigma: float, gamma: float) -> np.ndarray:
     """Unit-height Voigt profile on an odd, uniformly spaced ``offsets`` grid."""
     n = offsets.size
-    gaussian_kernel = np.exp(-0.5 * (offsets / sigma) ** 2)
-    gaussian_kernel /= gaussian_kernel.sum()
-    lorentz_kernel = gamma * gamma / (offsets * offsets + gamma * gamma)
-    lorentz_kernel /= lorentz_kernel.sum()
+
+    def _normalise(kernel: np.ndarray) -> np.ndarray:
+        total = float(kernel.sum())
+        if not np.isfinite(total) or total <= 0.0:
+            # numerically degenerate width: fall back to a delta kernel
+            kernel = np.zeros_like(offsets)
+            kernel[n // 2] = 1.0
+            return kernel
+        return kernel / total
+
+    gaussian_kernel = _normalise(np.exp(-0.5 * (offsets / sigma) ** 2))
+    lorentz_kernel = _normalise(gamma * gamma / (offsets * offsets + gamma * gamma))
     size = 2 * n  # zero padding -> the FFT computes a linear convolution
     spectrum = np.fft.rfft(gaussian_kernel, size) * np.fft.rfft(lorentz_kernel, size)
     full = np.fft.irfft(spectrum, size)
     start = n - 1 - (n // 2)
     profile = full[start : start + n]
-    return profile / profile.max()
+    peak = float(profile.max())
+    return profile / peak if peak > 0.0 else np.zeros_like(offsets)
 
 
 def voigt(
@@ -134,6 +143,7 @@ class PeakModel:
     init_width: Callable[[float], tuple[float, ...]]
     fwhm: Callable[[Sequence[float]], float]
     area: Callable[[Sequence[float]], float]
+    bounds: Callable[[Sequence[float], float, float], tuple[np.ndarray, np.ndarray]]
 
     @property
     def n_params(self) -> int:
@@ -166,6 +176,39 @@ def _pseudo_voigt_area(params: Sequence[float]) -> float:
     return float(eta * _lorentzian_area(params) + (1.0 - eta) * _gaussian_area(params))
 
 
+def _pseudo_voigt_bounds(
+    block: Sequence[float], x_lo: float, x_hi: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Width bounds plus the mixing ratio ``eta`` confined to ``[0, 1]``."""
+    lower, upper = _box_bounds(block, x_lo, x_hi)
+    lower[-1], upper[-1] = 0.0, 1.0
+    return lower, upper
+
+
+def _box_bounds(
+    block: Sequence[float], x_lo: float, x_hi: float, width_span: float = 5.0
+) -> tuple[np.ndarray, np.ndarray]:
+    """Generic box constraints for one peak block: positive widths, finite centre.
+
+    ``block`` is ``(amplitude, centre, *width_parameters)``.  Amplitudes are kept
+    positive, centres inside the fitted region and every width parameter between
+    a tiny value and ``width_span`` times its initial guess.  Without these
+    constraints the unbounded Lorentzian/Voigt tails can mimic the polynomial
+    background and the fit runs away to a degenerate solution.
+    """
+    n = len(block)
+    lower = np.full(n, -np.inf)
+    upper = np.full(n, np.inf)
+    lower[0] = 0.0  # amplitude
+    if n > 1:
+        lower[1], upper[1] = x_lo, x_hi  # centre
+    for index in range(2, n):
+        initial = abs(float(block[index]))
+        lower[index] = 1e-12
+        upper[index] = max(width_span * initial, 1e-12)
+    return lower, upper
+
+
 MODELS: dict[str, PeakModel] = {
     "gaussian": PeakModel(
         name="gaussian",
@@ -174,6 +217,7 @@ MODELS: dict[str, PeakModel] = {
         init_width=lambda fwhm: (fwhm / _FWHM_OVER_SIGMA,),
         fwhm=_gaussian_fwhm,
         area=_gaussian_area,
+        bounds=_box_bounds,
     ),
     "lorentzian": PeakModel(
         name="lorentzian",
@@ -182,6 +226,7 @@ MODELS: dict[str, PeakModel] = {
         init_width=lambda fwhm: (fwhm / 2.0,),
         fwhm=_lorentzian_fwhm,
         area=_lorentzian_area,
+        bounds=_box_bounds,
     ),
     "pseudo_voigt": PeakModel(
         name="pseudo_voigt",
@@ -190,6 +235,7 @@ MODELS: dict[str, PeakModel] = {
         init_width=lambda fwhm: (fwhm / _FWHM_OVER_SIGMA, fwhm / 2.0, 0.5),
         fwhm=_pseudo_voigt_fwhm,
         area=_pseudo_voigt_area,
+        bounds=_pseudo_voigt_bounds,
     ),
     "voigt": PeakModel(
         name="voigt",
@@ -198,6 +244,7 @@ MODELS: dict[str, PeakModel] = {
         init_width=lambda fwhm: (fwhm / 2.5, fwhm / 2.5),
         fwhm=lambda params: _voigt_metrics(params)[0],
         area=lambda params: _voigt_metrics(params)[1],
+        bounds=_box_bounds,
     ),
 }
 
@@ -221,11 +268,15 @@ def lm_fit(
     max_iter: int = 200,
     tol: float = 1e-10,
     lam0: float = 1e-3,
+    lower: np.ndarray | None = None,
+    upper: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float, int, bool]:
     """Levenberg-Marquardt least-squares fit of a generic model function.
 
     ``func`` is called as ``func(x, *params)``.  Derivatives are approximated by
     central differences, so any callable works without analytic Jacobians.
+    Optional ``lower``/``upper`` bounds project each trial step back into a box
+    (this is what keeps the long Lorentzian/Voigt tails from running away).
 
     Returns ``(params, errors, chi2, n_iter, converged)`` where ``errors`` are
     the 1-sigma standard errors from the covariance matrix ``(J^T J)^{-1} s^2``.
@@ -270,6 +321,10 @@ def lm_fit(
                 lam *= 10.0
                 continue
             trial_params = params + step_vec
+            if lower is not None:
+                trial_params = np.maximum(trial_params, lower)
+            if upper is not None:
+                trial_params = np.minimum(trial_params, upper)
             trial_resid = residual(trial_params)
             trial_chi2 = float(trial_resid @ trial_resid)
             if trial_chi2 < chi2:
@@ -452,6 +507,21 @@ def fit_region(
         initial.extend([float(amplitude), float(center), *spec.init_width(float(fwhm))])
     initial.extend(float(c) for c in background_coef)
 
+    # Box constraints: amplitudes positive, centres inside the region, widths
+    # positive but bounded relative to their initial guess, background free.
+    lower_parts, upper_parts = [], []
+    for index in range(n_peaks):
+        block = initial[index * per : (index + 1) * per]
+        block_lower, block_upper = spec.bounds(block, float(x.min()), float(x.max()))
+        lower_parts.append(np.asarray(block_lower, dtype=float))
+        upper_parts.append(np.asarray(block_upper, dtype=float))
+    if baseline_order is not None:
+        n_background = int(baseline_order) + 1
+        lower_parts.append(np.full(n_background, -np.inf))
+        upper_parts.append(np.full(n_background, np.inf))
+    lower = np.concatenate(lower_parts)
+    upper = np.concatenate(upper_parts)
+
     def curve(xx, *params):
         values = np.zeros_like(xx, dtype=float)
         for i in range(n_peaks):
@@ -462,7 +532,15 @@ def fit_region(
         return values
 
     params, errors, chi2, n_iter, converged = lm_fit(
-        curve, x, y, initial, weights=weights, max_iter=max_iter, tol=tol
+        curve,
+        x,
+        y,
+        initial,
+        weights=weights,
+        max_iter=max_iter,
+        tol=tol,
+        lower=lower,
+        upper=upper,
     )
     residual = y - curve(x, *params)
     dof = max(1, x.size - params.size)
