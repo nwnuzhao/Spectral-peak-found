@@ -35,7 +35,11 @@ class Peak:
     left_ip, right_ip
         Fractional sample positions where the contour at ``width`` is crossed.
     area
-        Integrated area above the local baseline, in x*y units.
+        Integrated area of the processed signal over a ``+-area_span * width``
+        window around the maximum, above the straight line joining the window
+        ends, in x*y units.  Accurate to a few percent for resolved peaks; for
+        blended peaks use the model area from
+        :func:`spectral_peaks.fitting.fit_peaks` instead.
     snr
         ``height / noise`` using the noise estimate of the detector call.
     fit
