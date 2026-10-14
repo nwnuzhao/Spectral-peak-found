@@ -20,11 +20,9 @@ classifiers = [
 dependencies = ["numpy>=1.21"]
 
 [project.optional-dependencies]
-test = ["pytest>=7", "scipy>=1.7", "matplotlib>=3.5"]
-plot = ["matplotlib>=3.5"]
-
-[project.scripts]
-spectral-peaks = "spectral_peaks.cli:main"
+# The library itself only needs NumPy; SciPy is used by the cross-validation
+# tests (they are skipped automatically when SciPy is missing).
+test = ["pytest>=7", "scipy>=1.7"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
