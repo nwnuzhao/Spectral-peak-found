@@ -146,6 +146,21 @@ def test_empty_results_are_handled():
     assert PeakResult(peaks=[], x=x, y=np.zeros(200)).positions().size == 0
 
 
+def test_max_width_rejects_broad_baseline_residue(spectrum):
+    """A low, wide residual bump passes a prominence gate but not a width limit."""
+    _, _, _, result = _run(spectrum)
+    wide = max(peak.width for peak in result)
+    narrow = detect_peaks(
+        spectrum[1], x=spectrum[0], baseline="airpls", smooth=11, max_width=0.8 * wide
+    )
+    assert all(peak.width <= 0.8 * wide for peak in narrow)
+    with pytest.raises(ValueError):
+        detect_peaks(
+            spectrum[1], x=spectrum[0], baseline="airpls", smooth=11,
+            width=(0.0, 100.0), max_width=50.0,
+        )
+
+
 def test_fit_model_is_applied_when_requested(spectrum):
     _, _, truth, result = _run(spectrum, fit_model="gaussian")
     for peak, expected in zip(result, truth):
