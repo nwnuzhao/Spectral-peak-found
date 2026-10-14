@@ -489,20 +489,78 @@ def cwt(y: np.ndarray, widths, wavelet=ricker) -> np.ndarray:
         raise ValueError("widths must be one-dimensional")
     if widths.size == 0:
         raise ValueError("widths must not be empty")
+    if np.any(widths < 1):
+        raise ValueError("widths must be >= 1")
     out = np.empty((widths.size, y.size))
     for i, width in enumerate(widths):
-        scale = max(2, int(round(float(width))))
+        scale = max(1, int(round(float(width))))  # scales are integers, as in SciPy
         wavelet_data = wavelet(int(min(10 * scale, y.size)), scale)
         out[i] = np.convolve(y, wavelet_data, mode="same")
     return out
 
 
+def _cwt_ridge_points(magnitude: np.ndarray, snr: float):
+    """Ridge candidates: per scale, local maxima of ``|CWT|`` above a noise level.
+
+    The noise level of a scale is the robust MAD estimator
+    ``1.4826 * median(|row - median(row)|)`` of that scale's ``|CWT|``.  A robust
+    estimator is essential here: a percentile of the row would be dominated by
+    the wavelet ringing of the peaks themselves and would let noise through.
+
+    Returns ``(points, levels)`` where ``points[i]`` holds the sample indices
+    that are ridges at scale ``i`` and ``levels[i]`` the noise level of scale
+    ``i``.
+    """
+    levels = np.empty(magnitude.shape[0])
+    points: list[np.ndarray] = []
+    for index in range(magnitude.shape[0]):
+        row = magnitude[index]
+        levels[index] = 1.4826 * float(np.median(np.abs(row - np.median(row))))
+        level = float(snr) * levels[index]
+        found, _, _ = _local_maxima_1d(row)
+        points.append(found[row[found] >= level])
+    return points, levels
+
+
+def _connect_ridges(
+    points: list[np.ndarray], widths: np.ndarray
+) -> list[list[tuple[int, int]]]:
+    """Link ridge points into ridge lines, walking from the largest scale down.
+
+    A ridge point at scale ``j`` extends an existing line when it lies within
+    ``widths[j] / 2`` samples of that line's most recent point; otherwise it
+    starts a new line.  Lines therefore span a contiguous range of scales, which
+    is what distinguishes a real peak from a noise blip that only shows up at a
+    single scale.  Each line is a list of ``(scale_index, position)`` tuples
+    ordered from large to small scales.
+    """
+    lines: list[list[tuple[int, int]]] = []
+    active: list[int] = []
+    for index in range(len(points) - 1, -1, -1):
+        max_jump = max(1.0, 0.5 * float(widths[index]))
+        fresh: list[int] = []
+        for position in points[index]:
+            best: int | None = None
+            best_distance = np.inf
+            for line_index in active:
+                distance = abs(float(position) - float(lines[line_index][-1][1]))
+                if distance <= max_jump and distance < best_distance:
+                    best, best_distance = line_index, distance
+            if best is None:
+                lines.append([(index, int(position))])
+                fresh.append(len(lines) - 1)
+            else:
+                lines[best].append((index, int(position)))
+                fresh.append(best)
+        active = fresh
+    return lines
+
+
 def find_peaks_cwt(
     y: np.ndarray,
     widths=None,
-    snr: float = 2.0,
-    noise_perc: float = 10.0,
-    min_scales: int | None = None,
+    snr: float = 3.0,
+    min_length: int | None = None,
     min_distance: int = 1,
     refine: bool = True,
     wavelet=ricker,
@@ -514,6 +572,62 @@ def find_peaks_cwt(
     wlen: int | None = None,
     rel_height: float = 0.5,
 ) -> tuple[np.ndarray, dict]:
+    """Peak detection by ridge tracking in a continuous wavelet transform.
+
+    The signal is transformed with a Ricker wavelet at every scale in
+    ``widths``.  At each scale the ridges (local maxima of ``|CWT|``) above
+    ``snr`` times that scale's noise level become ridge points, where the noise
+    level is the robust MAD estimate ``1.4826 * median(|row - median(row)|)``.  Ridge
+    points are then linked across scales into *ridge lines* (walking from the
+    largest scale downwards), and a line is accepted as a peak when it
+
+    * spans at least ``min_length`` scales,
+    * stays above the noise level, and
+    * keeps its position while the scale changes (the side lobes of a broad peak
+      drift outwards in proportion to the scale, so this rejects them).
+
+    Surviving candidates closer than ``min_distance`` are merged, keeping the
+    strongest, and are finally snapped to the local maximum of ``y`` when
+    ``refine`` is set.
+
+    The Ricker response of a Gaussian peaks at a scale close to the Gaussian's
+    FWHM in samples, so ``widths`` should span roughly half to twice the widths
+    you expect.  Because the wavelet responds to shape rather than to absolute
+    height, this detector also copes with imperfectly corrected baselines.
+
+    Parameters
+    ----------
+    widths
+        Wavelet scales in samples.  Defaults to ``1..10``.
+    snr
+        Per-scale threshold in units of that scale's noise level.  Lower it
+        (2.0) for weak peaks, raise it (4-5) to suppress false positives in
+        noisy data.
+    min_length
+        Number of scales a ridge must span (default: a quarter of
+        ``len(widths)``, at least 2).
+    min_distance
+        Candidates closer than this many samples are merged, keeping the
+        strongest.
+    refine
+        Snap candidates to the local maximum of the signal.
+
+    Returns ``(peaks, properties)`` where ``properties`` holds ``scales`` (the
+    largest scale at which each peak is a ridge -- a relative width indicator),
+    ``cwt_response``, ``ridge_length`` and, for any requested filter, the usual
+    ``height``/``prominence``/``width`` arrays.
+    """
+    y = np.asarray(y, dtype=float)
+    if y.ndim != 1:
+        raise ValueError("y must be one-dimensional")
+    n = y.size
+    if n < 5:
+        raise ValueError("y is too short for wavelet detection")
+    if widths is None:
+        widths = np.arange(1, min(11, max(2, n // 3)))
+    widths = np.atleast_1d(np.asarray(widths, dtype=float))
+    if np.any(widths < 1):
+        raise ValueError("widths must be >= 1")
     """Peak detection by ridge tracking in a continuous wavelet transform.
 
     The signal is transformed with a Ricker wavelet at every scale in
@@ -563,42 +677,73 @@ def find_peaks_cwt(
         raise ValueError("widths must be >= 1")
 
     transform = np.abs(cwt(y, widths, wavelet=wavelet))
-    counts = np.zeros(n, dtype=int)
-    response = np.zeros(n)
-    scale_of = np.zeros(n)
-    for i, scale in enumerate(widths):
-        row = transform[i]
-        level = float(snr) * float(np.percentile(row, noise_perc))
-        ridges, _, _ = _local_maxima_1d(row)
-        ridges = ridges[row[ridges] >= level]
-        if ridges.size == 0:
+    points, noise = _cwt_ridge_points(transform, snr=snr)
+    lines = _connect_ridges(points, widths)
+
+    if min_length is None:
+        min_length = max(2, int(np.ceil(0.25 * widths.size)))
+    required = max(1, int(min_length))
+
+    candidates: list[int] = []
+    response: list[float] = []
+    scale_of: list[float] = []
+    lengths: list[int] = []
+    for line in lines:
+        if len(line) < required:
             continue
-        counts[ridges] += 1
-        np.maximum.at(response, ridges, row[ridges])
-        np.maximum.at(scale_of, ridges, float(scale))
+        scale_index, position = line[0]  # the widest scale of the ridge
+        strengths = np.array([transform[j, p] for j, p in line])
+        noise_level = noise[scale_index]
+        if noise_level > 0.0 and strengths.max() < float(snr) * noise_level:
+            continue
+        # A true apex ridge keeps its position while the scale changes; the side
+        # lobes of a broad peak move outwards in proportion to the scale.
+        positions = np.array([p for _, p in line], dtype=float)
+        scales = widths[[j for j, _ in line]]
+        scale_range = float(scales.max() - scales.min())
+        drift = float(positions.max() - positions.min())
+        if drift > 0.5 * scale_range:
+            continue
+        candidates.append(int(position))
+        response.append(float(strengths.max()))
+        scale_of.append(float(widths[scale_index]))
+        lengths.append(len(line))
 
-    if min_scales is None:
-        min_scales = 2 if widths.size > 2 else 1
-    candidates = np.nonzero(counts >= max(1, int(min_scales)))[0]
-    if candidates.size and min_distance > 1:
-        candidates = candidates[_filter_by_distance(candidates, response[candidates], min_distance)]
+    candidates_array = np.asarray(candidates, dtype=np.intp)
+    response_array = np.asarray(response, dtype=float)
+    scale_array = np.asarray(scale_of, dtype=float)
+    length_array = np.asarray(lengths, dtype=np.intp)
 
-    if refine and candidates.size:
+    if candidates_array.size and min_distance > 1:
+        keep = _filter_by_distance(candidates_array, response_array, min_distance)
+        candidates_array = candidates_array[keep]
+        response_array = response_array[keep]
+        scale_array = scale_array[keep]
+        length_array = length_array[keep]
+
+    if refine and candidates_array.size:
         half = max(1, int(np.ceil(widths.max() / 2.0)))
-        refined = candidates.copy()
-        for k, position in enumerate(candidates):
-            lo = max(0, position - half)
-            hi = min(n, position + half + 1)
+        refined = candidates_array.copy()
+        for k, position in enumerate(candidates_array):
+            lo = max(0, int(position) - half)
+            hi = min(n, int(position) + half + 1)
             refined[k] = lo + int(np.argmax(y[lo:hi]))
-        candidates = np.unique(refined)
+        order = np.argsort(refined, kind="stable")
+        candidates_array = refined[order]
+        keep = np.r_[True, np.diff(candidates_array) > 0]
+        candidates_array = candidates_array[keep]
+        response_array = response_array[order][keep]
+        scale_array = scale_array[order][keep]
+        length_array = length_array[order][keep]
 
     properties: dict[str, np.ndarray] = {
-        "scales": scale_of[candidates],
-        "cwt_response": response[candidates],
+        "scales": scale_array,
+        "cwt_response": response_array,
+        "ridge_length": length_array,
     }
     return _filter_peaks(
         y,
-        candidates,
+        candidates_array,
         properties,
         height=height,
         threshold=threshold,
@@ -630,8 +775,8 @@ def detect_peaks(
     plateau_size=None,
     derivative_criterion: str = "first",
     cwt_widths=None,
-    cwt_snr: float = 2.0,
-    cwt_min_scales: int | None = None,
+    cwt_snr: float = 3.0,
+    cwt_min_length: int | None = None,
     max_peaks: int | None = None,
     fit_model: str | None = None,
     fit_kwargs: dict | None = None,
@@ -737,7 +882,7 @@ def detect_peaks(
             processed,
             widths=cwt_widths,
             snr=cwt_snr,
-            min_scales=cwt_min_scales,
+            min_length=cwt_min_length,
             **common,
         )
     else:
