@@ -293,6 +293,11 @@ def lm_fit(
         down[j] -= step
         jacobian[:, j] = (func(x, *down) - func(x, *up)) / (2.0 * step) * scale
     dof = max(1, x.size - n_params)
+    # A stalled fit whose gradient has vanished *is* at a minimum (this also
+    # covers problems that are solved exactly, where no step can improve anything).
+    if not converged:
+        gradient_norm = float(np.linalg.norm(jacobian.T @ residual(params)))
+        converged = gradient_norm <= 1e-8 * max(1.0, float(np.sqrt(chi2)))
     covariance = np.linalg.pinv(jacobian.T @ jacobian) * (chi2 / dof)
     errors = np.sqrt(np.abs(np.diag(covariance)))
     return params, errors, chi2, iterations, converged
@@ -547,12 +552,12 @@ def fit_peaks(
     ``window`` sets the half-width of the fitting region in x units; the default
     is ``2 * measured width`` per peak (at least five samples).
     """
+    spec = get_model(model)  # validate the model even when there is nothing to fit
     peaks = list(getattr(result, "peaks", []))
     if not peaks:
         return result
     x = np.asarray(result.x, dtype=float)
     y = np.asarray(result.y, dtype=float)
-    spec = get_model(model)
     full_half = 0.25 * float(x.max() - x.min())
 
     spans: list[tuple[int, int]] = []

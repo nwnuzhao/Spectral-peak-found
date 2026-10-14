@@ -120,7 +120,8 @@ def test_derivative_reports_sub_sample_positions():
     x = np.arange(1001.0)
     y = gaussian(x, 500.37, 1.0, 30.0)
     peaks, properties = find_peaks_derivative(y, smooth_window=15, smooth_polyorder=3)
-    assert peaks.size == 1 and peaks[0] == 501
+    assert peaks.size == 1
+    assert peaks[0] == 500  # the apex sample
     assert float(properties["positions"][0]) == pytest.approx(500.37, abs=1e-3)
 
 

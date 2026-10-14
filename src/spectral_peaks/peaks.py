@@ -424,8 +424,16 @@ def find_peaks_derivative(
         denom = d1[prev] - d1[crossings]
         with np.errstate(divide="ignore", invalid="ignore"):
             frac = np.where(denom > 0.0, d1[prev] / np.where(denom > 0.0, denom, 1.0), 0.0)
-        peaks = crossings
         positions = prev + np.clip(frac, 0.0, 1.0)
+        # The crossing sits between the apex and the next sample: report the
+        # higher of the two as the peak index (otherwise topological prominence
+        # would be measured against the apex itself).
+        apex = np.where(smoothed[crossings] >= smoothed[prev], crossings, prev)
+        order = np.argsort(apex, kind="stable")
+        apex, positions = apex[order], positions[order]
+        keep = np.r_[True, np.diff(apex) > 0]
+        peaks = apex[keep]
+        positions = positions[keep]
     elif criterion in ("second", "second_derivative"):
         candidates, _, _ = _local_maxima_1d(-d2)
         candidates = candidates[d2[candidates] < 0.0]
@@ -778,6 +786,7 @@ def detect_peaks(
     cwt_snr: float = 3.0,
     cwt_min_length: int | None = None,
     max_peaks: int | None = None,
+    area_span: float = 3.0,
     fit_model: str | None = None,
     fit_kwargs: dict | None = None,
 ) -> PeakResult:
@@ -807,9 +816,16 @@ def detect_peaks(
     noise
         Override the automatic noise estimate used for the SNR column.
     height, threshold, distance, prominence, width, plateau_size
-        Filters forwarded to the detector (see :func:`find_peaks`).
+        Filters forwarded to the detector (see :func:`find_peaks`).  When none of
+        ``height``, ``prominence`` or ``threshold`` is given, a default
+        prominence filter of five times the robust noise scale of the processed
+        signal is applied, which suppresses noise ripples and
+        baseline-correction artefacts.
     max_peaks
         Keep only the ``max_peaks`` most prominent peaks.
+    area_span
+        Width of the integration window used for ``Peak.area``, in units of the
+        measured peak width (``3.0`` means ``+-1.5`` FWHM).
     fit_model
         When given (``"gaussian"``, ``"lorentzian"``, ``"pseudo_voigt"`` or
         ``"voigt"``) every peak is refined by a local least-squares fit, whose
@@ -855,6 +871,18 @@ def detect_peaks(
                 processed, window, min(int(smooth_polyorder), window - 1), mode="reflect"
             )
 
+    sigma = (
+        float(estimate_noise(y, method=noise_method)) if noise is None else float(noise)
+    )
+    if height is None and prominence is None and threshold is None:
+        # Sensible default: without any explicit filter the detectors would
+        # happily return every noise ripple (and every baseline-correction
+        # artefact).  Require a 5-sigma prominence, using the robust MAD scale of
+        # the processed signal; pass height/prominence/threshold to override.
+        scale = float(estimate_noise(processed, method="mad"))
+        if scale > 0.0:
+            prominence = 5.0 * scale
+
     common = dict(
         height=height,
         threshold=threshold,
@@ -892,9 +920,6 @@ def detect_peaks(
     if positions is None:
         positions = peaks.astype(float)
 
-    sigma = (
-        float(estimate_noise(processed, method=noise_method)) if noise is None else float(noise)
-    )
     prom, left_bases, right_bases = peak_prominences(processed, peaks, wlen=wlen)
     widths, _, left_ips, right_ips = peak_widths(
         processed,
@@ -908,13 +933,21 @@ def detect_peaks(
         right_x = np.interp(right_ips, grid, xs)
         widths_x = right_x - left_x
         positions_x = np.interp(positions, grid, xs)
-        areas = peak_areas(processed, left_ips, right_ips, x=xs)
     else:
         left_x = left_ips
         right_x = right_ips
         widths_x = widths
         positions_x = positions
-        areas = peak_areas(processed, left_ips, right_ips)
+
+    # Peak area: integrate the processed signal over a +-area_span * width window
+    # around each maximum, above the straight line joining the window ends.
+    half_span = 0.5 * float(area_span) * widths
+    areas = peak_areas(
+        processed,
+        positions - half_span,
+        positions + half_span,
+        x=xs if x_units else None,
+    )
 
     detected = [
         Peak(
