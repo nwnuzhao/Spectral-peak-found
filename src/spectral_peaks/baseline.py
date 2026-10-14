@@ -235,12 +235,31 @@ def rolling_ball_baseline(
     smoothing: int | None = None,
     mode: str = "reflect",
 ) -> np.ndarray:
-    """Rolling-ball baseline (morphological opening with a ball-shaped element).
+    """Rolling-ball baseline (morphological opening with a curved element).
 
-    ``radius`` is given in samples.  A ball of that radius is rolled underneath
-    the spectrum; the locus of its top edge is the baseline, which is why the
-    curvature of the background is followed naturally.  ``smoothing`` applies an
-    optional boxcar filter of that width to the result.
+    ``radius`` is in samples.  The structuring element is the contact profile of
+    a ball of that radius,
+
+        ``B(d) = radius - sqrt(radius**2 - d**2)``,
+
+    which is zero at the contact point and rises to ``radius`` at both ends of
+    the window.  The erosion
+
+        ``c(x) = min_d [ y(x + d) - B(d) ]``
+
+    gives the lowest position the contact point can take, and the dilation
+
+        ``baseline(x) = max_d [ c(x - d) + B(d) ]``
+
+    rebuilds the smooth background from it.
+
+    Properties worth knowing: the result equals the signal on flat or monotone
+    stretches and cuts off everything narrower than the ball, but it is biased
+    *upwards* where the background curves (the ball cannot enter a concave
+    region); the bias grows roughly quadratically with ``radius``.  Keep
+    ``radius`` a few times the half-width of the widest peak and sanity-check
+    the result on a peak-free region of your data.  ``smoothing`` applies an
+    optional boxcar filter of that width on top.
     """
     y = _as_1d(y)
     radius = int(radius)
@@ -251,9 +270,10 @@ def rolling_ball_baseline(
     offsets = np.arange(-radius, radius + 1, dtype=float)
     ball = radius - np.sqrt(np.maximum(radius * radius - offsets * offsets, 0.0))
 
-    eroded = (sliding_window_view(_pad(y, radius, radius, mode), 2 * radius + 1) - ball).min(axis=1)
+    window = 2 * radius + 1
+    eroded = (sliding_window_view(_pad(y, radius, radius, mode), window) - ball).min(axis=1)
     opened = (
-        sliding_window_view(_pad(eroded, radius, radius, mode), 2 * radius + 1) + ball
+        sliding_window_view(_pad(eroded, radius, radius, mode), window) + ball
     ).max(axis=1)
     baseline = np.minimum(opened, y)
     if smoothing:
